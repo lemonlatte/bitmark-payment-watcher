@@ -213,6 +213,7 @@ func (w *PaymentWatcher) ValidatePayment(payId string) (isValid bool) {
 
 func (w *PaymentWatcher) sync() {
 	for {
+	SYNC_LOOP:
 		for {
 			p := w.getPeer()
 			log.Println(p, "height:", p.LastBlock(), "last height:", w.lastHeight)
@@ -228,7 +229,7 @@ func (w *PaymentWatcher) sync() {
 						time.Sleep(20 * time.Second)
 					}
 				case ErrMissingBlockHeader:
-					break
+					break SYNC_LOOP
 				}
 			} else {
 				if p.LastBlock() <= w.lastHeight {
