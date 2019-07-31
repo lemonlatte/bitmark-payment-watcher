@@ -466,10 +466,17 @@ type PaymentInfo struct {
 }
 
 func (w *PaymentWatcher) rollbackBlock() error {
-	deleteDownTo := w.checkpoint.Height - checkpointBackTo
-	log.Println("start rollback blocks: ", deleteDownTo)
+	deleteDownTo := w.lastHeight - checkpointBackTo
 
-	w.storage.RollbackTo(w.lastHeight, deleteDownTo)
+	// prevent from rolling back too much blocks
+	if deleteDownTo < w.checkpoint.Height {
+		deleteDownTo = w.checkpoint.Height
+	}
+
+	log.Println("start rollback blocks to:", deleteDownTo)
+	if err := w.storage.RollbackTo(w.lastHeight, deleteDownTo); err != nil {
+		return err
+	}
 
 	lastHash, err := w.storage.GetHash(deleteDownTo)
 	if err != nil {
