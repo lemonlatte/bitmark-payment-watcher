@@ -198,19 +198,6 @@ func (w *PaymentWatcher) fetchMoreAddress() {
 	}
 }
 
-func (w *PaymentWatcher) ValidatePayment(payId string) (isValid bool) {
-	height, _, err := w.storage.GetPayment(payId)
-	if err != nil {
-		return
-	}
-
-	if w.lastHeight-int32(height) >= 2 {
-		isValid = true
-	}
-
-	return
-}
-
 func (w *PaymentWatcher) sync() {
 	for {
 	SYNC_LOOP:
