@@ -8,7 +8,6 @@ import (
 	"log"
 	"net"
 	"reflect"
-	"strconv"
 	"sync"
 	"time"
 
@@ -44,7 +43,6 @@ type PaymentWatcher struct {
 	networkParams *chaincfg.Params
 	checkpoint    chaincfg.Checkpoint
 	storage       *PaymentStorage
-	db            *bolt.DB
 
 	lastHash     *chainhash.Hash
 	lastHeight   int32
@@ -61,7 +59,7 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 		log.Fatal(err)
 	}
 
-	addrManager := addrmgr.New("addrCache", nil)
+	addrManager := addrmgr.New(".", nil)
 	checkpoint := networkParams.Checkpoints[len(networkParams.Checkpoints)-1]
 
 	w := &PaymentWatcher{
@@ -70,7 +68,6 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 		networkParams:  networkParams,
 		checkpoint:     checkpoint,
 		storage:        NewPaymentStorage(db),
-		db:             db,
 		onHeadersErr:   make(chan error, 0),
 		stopChan:       make(chan struct{}, 0),
 	}
@@ -150,6 +147,17 @@ func (w *PaymentWatcher) syncHeaderFromPeer(p *peer.Peer) error {
 	return nil
 }
 
+// QueryBlockDataByPeer will send GetData command to a peer
+func (w *PaymentWatcher) QueryBlockDataByPeer(p *peer.Peer, hash *chainhash.Hash) {
+	blockDataMsg := wire.NewMsgGetData()
+	blockDataMsg.AddInvVect(&wire.InvVect{
+		Type: wire.InvTypeBlock,
+		Hash: *hash,
+	})
+
+	p.QueueMessage(blockDataMsg, nil)
+}
+
 // lookupPayment will trigger a block re-scan process to check potential payments
 // back to certains blocks
 func (w *PaymentWatcher) lookupPaymentFromPeer(p *peer.Peer, lookUpToHeight int32) {
@@ -158,33 +166,21 @@ func (w *PaymentWatcher) lookupPaymentFromPeer(p *peer.Peer, lookUpToHeight int3
 	}
 
 	if p != nil {
-		// Use `Update` to prevent race condition
-		w.db.Update(func(tx *bolt.Tx) error {
-			lastHeight := []byte(fmt.Sprintf("%08x", w.lastHeight))
-			startHeight := []byte(fmt.Sprintf("%08x", lookUpToHeight))
-			c := tx.Bucket(HeightBucket).Cursor()
-			log.Printf("look up payments by height from: %d, to: %d\n", lookUpToHeight, w.lastHeight)
-			// Seek returns the last query key, the key might not be the latest
-			for k, v := c.Seek(lastHeight); k != nil && bytes.Compare(k, startHeight) >= 0; k, v = c.Prev() {
-				hash, err := chainhash.NewHash(v)
-				if err != nil {
-					fmt.Println("error", err)
-				}
-
-				// FIXME: debugging
-				// i, _ := strconv.ParseInt(string(k), 16, 32)
-				// log.Println("Check block data:", hash, i)
-
-				blockDataMsg := wire.NewMsgGetData()
-				blockDataMsg.AddInvVect(&wire.InvVect{
-					Type: wire.InvTypeBlock,
-					Hash: *hash,
-				})
-
-				p.QueueMessage(blockDataMsg, nil)
+		log.Printf("look up payments by height from: %d, to: %d\n", lookUpToHeight, w.lastHeight)
+		for h := w.lastHeight; h >= lookUpToHeight; h-- {
+			hash, err := w.storage.GetHash(h)
+			if err != nil {
+				fmt.Println("error", err)
+				return
 			}
-			return nil
-		})
+
+			if hash == nil {
+				fmt.Println("WARN: should not have empty hash. is something missing?")
+			}
+
+			log.Println("Check block data:", hash, h)
+			w.QueryBlockDataByPeer(p, hash)
+		}
 	}
 }
 
@@ -403,67 +399,45 @@ func (w *PaymentWatcher) onPeerHeaders(p *peer.Peer, msg *wire.MsgHeaders) {
 	var hasNewHeader bool
 	var newHash chainhash.Hash
 	var firstNewHeight, newHeight int32
-	if err = w.db.Update(func(tx *bolt.Tx) error {
-		headers := tx.Bucket(HeaderBucket)
-		heights := tx.Bucket(HeightBucket)
 
-		for _, h := range msg.Headers {
-			newHash = h.BlockHash()
-			newHashByte := newHash.CloneBytes()
+	for _, h := range msg.Headers {
+		newHash = h.BlockHash()
+		newHashByte := newHash.CloneBytes()
 
-			// check if current height has already existed
-			if heightByte := headers.Get(newHashByte); heightByte != nil {
-				currentHeight, err := strconv.ParseInt(string(heightByte), 16, 32)
-				if err != nil {
-					return err
-				}
+		newHeight, _ = w.storage.GetHeight(&newHash)
 
-				newHeight = int32(currentHeight)
-
-				if time.Since(h.Timestamp) < 48*time.Hour && firstNewHeight == 0 {
-					firstNewHeight = newHeight
-				}
-
-				if reflect.DeepEqual(heights.Get(heightByte), newHashByte) {
-					// FIXME: debug log
-					// log.Println("omit the same hash", newHash)
-					continue
-				}
-			}
-
-			hasNewHeader = true
-			prevHeightByte := headers.Get(h.PrevBlock.CloneBytes())
-
-			if prevHeightByte == nil {
-				p.Disconnect()
-				return ErrMissingBlockHeader
-			}
-
-			prevHeight, err := strconv.ParseInt(string(prevHeightByte), 16, 32)
-			if err != nil {
-				return err
-			}
-
-			newHeight = int32(prevHeight) + 1
-
+		if newHeight != 0 {
 			if time.Since(h.Timestamp) < 48*time.Hour && firstNewHeight == 0 {
 				firstNewHeight = newHeight
 			}
-
-			// FIXME: temp hide
-			log.Println("Add block hash:", newHash, newHeight)
-			if err := headers.Put(newHash.CloneBytes(), []byte(fmt.Sprintf("%08x", newHeight))); err != nil {
-				return err
-			}
-			if err := heights.Put([]byte(fmt.Sprintf("%08x", newHeight)), newHash.CloneBytes()); err != nil {
-				return err
+			hash, _ := w.storage.GetHash(newHeight)
+			if reflect.DeepEqual(hash.CloneBytes(), newHashByte) {
+				// FIXME: debug log
+				// log.Println("omit the same hash", hash)
+				continue
 			}
 		}
 
-		return nil
-	}); err != nil {
-		log.Println("fail to update hash: ", err)
-		return
+		hasNewHeader = true
+
+		prevHeight, err := w.storage.GetHeight(&h.PrevBlock)
+		if err != nil {
+			p.Disconnect()
+			err = ErrMissingBlockHeader
+			return
+		}
+
+		newHeight = prevHeight + 1
+
+		if time.Since(h.Timestamp) < 48*time.Hour && firstNewHeight == 0 {
+			firstNewHeight = newHeight
+		}
+
+		// FIXME: temp hide
+		log.Println("Add block hash:", newHash, newHeight)
+		if err = w.storage.StoreBlock(newHeight, &newHash); err != nil {
+			return
+		}
 	}
 
 	if !hasNewHeader {
@@ -471,6 +445,7 @@ func (w *PaymentWatcher) onPeerHeaders(p *peer.Peer, msg *wire.MsgHeaders) {
 	}
 
 	if firstNewHeight > 0 {
+		// TODO: look up from range instead of from the latest because there will be a race condition
 		go w.lookupPaymentFromPeer(p, firstNewHeight)
 	}
 
@@ -521,7 +496,7 @@ func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byt
 		return
 	}
 
-	if w.storage.HasReceipt(blockHeight) {
+	if w.storage.HasBlockReceipt(blockHeight) {
 		// log.Println("block has already processed:", blockHeight)
 		return
 	}
@@ -570,10 +545,7 @@ func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byt
 	}
 
 	// add a receipt for processed blocks
-	if err := w.db.Update(func(tx *bolt.Tx) error {
-		bucket := tx.Bucket(ReceiptBucket)
-		return bucket.Put([]byte(fmt.Sprintf("%08x", blockHeight)), []byte{})
-	}); err != nil {
+	if err := w.storage.SetBlockReceipt(blockHeight); err != nil {
 		log.Println("can not set block processed:", err)
 	}
 }

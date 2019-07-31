@@ -52,6 +52,7 @@ func (s *PaymentStorage) Init() error {
 	})
 }
 
+// GetHeight returns height for a specific hash
 func (s *PaymentStorage) GetHeight(hash *chainhash.Hash) (int32, error) {
 	var height int32
 
@@ -83,6 +84,7 @@ func (s *PaymentStorage) GetHeight(hash *chainhash.Hash) (int32, error) {
 	return height, nil
 }
 
+// GetCheckpoint returns the hash of the last saved checkpoint in the storage
 func (s *PaymentStorage) GetCheckpoint() (*chainhash.Hash, error) {
 	var hash *chainhash.Hash
 	if err := s.boltdb.View(func(tx *bolt.Tx) (err error) {
@@ -105,6 +107,7 @@ func (s *PaymentStorage) GetCheckpoint() (*chainhash.Hash, error) {
 	return hash, nil
 }
 
+// SetCheckpoint saves the hash of a give height as a checkpoint
 func (s *PaymentStorage) SetCheckpoint(height int32) error {
 	return s.boltdb.Update(func(tx *bolt.Tx) (err error) {
 		headers := tx.Bucket(HeaderBucket)
@@ -120,6 +123,7 @@ func (s *PaymentStorage) SetCheckpoint(height int32) error {
 	})
 }
 
+// GetHash returns the hash of a give height
 func (s *PaymentStorage) GetHash(height int32) (*chainhash.Hash, error) {
 	var hash *chainhash.Hash
 	if err := s.boltdb.View(func(tx *bolt.Tx) error {
@@ -136,6 +140,7 @@ func (s *PaymentStorage) GetHash(height int32) (*chainhash.Hash, error) {
 	return hash, nil
 }
 
+// StoreBlock saves a pair of hash and its height
 func (s *PaymentStorage) StoreBlock(height int32, hash *chainhash.Hash) error {
 	return s.boltdb.Update(func(tx *bolt.Tx) error {
 		headers := tx.Bucket(HeaderBucket)
@@ -151,6 +156,7 @@ func (s *PaymentStorage) StoreBlock(height int32, hash *chainhash.Hash) error {
 	})
 }
 
+// RollbackTo deletes blocks from a block down a another
 func (s *PaymentStorage) RollbackTo(deleteFrom, deleteTo int32) error {
 	if deleteFrom <= deleteTo {
 		return errors.New("incorrect range to blocks to rollback")
@@ -161,6 +167,7 @@ func (s *PaymentStorage) RollbackTo(deleteFrom, deleteTo int32) error {
 		headers := tx.Bucket(HeaderBucket)
 
 		for i := deleteFrom; i > deleteTo; i-- {
+			fmt.Println("delete block:", i)
 			heightsByte := []byte(fmt.Sprintf("%08x", i))
 			hashByte := heights.Get(heightsByte)
 			if err := heights.Delete(heightsByte); err != nil {
@@ -175,7 +182,16 @@ func (s *PaymentStorage) RollbackTo(deleteFrom, deleteTo int32) error {
 
 }
 
-func (s *PaymentStorage) HasReceipt(height int32) bool {
+// SetBlockReceipt will mark a given block as processed
+func (s *PaymentStorage) SetBlockReceipt(height int32) error {
+	return s.boltdb.Update(func(tx *bolt.Tx) error {
+		bucket := tx.Bucket(ReceiptBucket)
+		return bucket.Put([]byte(fmt.Sprintf("%08x", height)), []byte{})
+	})
+}
+
+// HasBlockReceipt validate whether a given block is processed by checking its receipt
+func (s *PaymentStorage) HasBlockReceipt(height int32) bool {
 	var hasReceipt bool
 
 	s.boltdb.View(func(tx *bolt.Tx) error {
@@ -189,6 +205,7 @@ func (s *PaymentStorage) HasReceipt(height int32) bool {
 	return hasReceipt
 }
 
+// StorePayment saves payment information for a pay id.
 func (s *PaymentStorage) StorePayment(payId []byte, payInfo PaymentInfo) error {
 	b, err := json.Marshal(payInfo)
 	if err != nil {
@@ -201,6 +218,7 @@ func (s *PaymentStorage) StorePayment(payId []byte, payInfo PaymentInfo) error {
 	})
 }
 
+// GetPayment get payment information by a pay id.
 func (s *PaymentStorage) GetPayment(payId string) (height int32, payInfo PaymentInfo, err error) {
 	id, err := hex.DecodeString(payId)
 	if err != nil {
