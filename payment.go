@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"log"
 	"net"
 	"reflect"
 	"sync"
@@ -18,8 +17,10 @@ import (
 	"github.com/btcsuite/btcd/peer"
 	"github.com/btcsuite/btcd/txscript"
 	"github.com/btcsuite/btcd/wire"
-
 	bolt "github.com/etcd-io/bbolt"
+
+	"github.com/bitmark-inc/exitwithstatus"
+	"github.com/bitmark-inc/logger"
 )
 
 const checkpointBackTo = 2000
@@ -43,6 +44,7 @@ type PaymentWatcher struct {
 	networkParams *chaincfg.Params
 	checkpoint    chaincfg.Checkpoint
 	storage       *PaymentStorage
+	log           *logger.L
 
 	lastHash     *chainhash.Hash
 	lastHeight   int32
@@ -56,7 +58,7 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 
 	db, err := bolt.Open("btcd.db", 0600, nil)
 	if err != nil {
-		log.Fatal(err)
+		exitwithstatus.Message(err.Error())
 	}
 
 	addrManager := addrmgr.New(".", nil)
@@ -68,6 +70,7 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 		networkParams:  networkParams,
 		checkpoint:     checkpoint,
 		storage:        NewPaymentStorage(db),
+		log:            logger.New("payment"),
 		onHeadersErr:   make(chan error, 0),
 		stopChan:       make(chan struct{}, 0),
 	}
@@ -95,7 +98,7 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 			}
 
 			if w.connectedPeers.Exist(addr.String()) {
-				// log.Println("ignore connected peer:", addr.String())
+				w.log.Warnf("ignore connected peer: %s", addr.String())
 				return nil, errors.New("failed to find appropriate address to return")
 			}
 
@@ -108,7 +111,7 @@ func NewPaymentWatcher(networkParams *chaincfg.Params) *PaymentWatcher {
 	}
 	connManager, err := connmgr.New(&config)
 	if err != nil {
-		log.Fatal(err)
+		exitwithstatus.Message(err.Error())
 	}
 
 	w.connManager = connManager
@@ -129,7 +132,7 @@ func (w *PaymentWatcher) syncHeaderFromPeer(p *peer.Peer) error {
 		}
 	}
 
-	log.Println("syn from block header:", hash)
+	w.log.Infof("Fetch headers from last block hash: %s", hash)
 	headerMsg := wire.NewMsgGetHeaders()
 	headerMsg.AddBlockLocatorHash(hash)
 	p.QueueMessage(headerMsg, nil)
@@ -140,7 +143,7 @@ func (w *PaymentWatcher) syncHeaderFromPeer(p *peer.Peer) error {
 			return err
 		}
 	case <-time.After(HeaderSyncTimeout):
-		log.Println("timed out waiting for the block header data")
+		w.log.Warnf("Timed out waiting for the block header data")
 		return ErrTimeoutWaitHeader
 	}
 
@@ -166,7 +169,7 @@ func (w *PaymentWatcher) lookupPaymentFromPeer(p *peer.Peer, lookUpToHeight int3
 	}
 
 	if p != nil {
-		log.Printf("look up payments by height from: %d, to: %d\n", lookUpToHeight, w.lastHeight)
+		w.log.Infof("Look up payments by height from: %d, to: %d\n", lookUpToHeight, w.lastHeight)
 		for h := w.lastHeight; h >= lookUpToHeight; h-- {
 			hash, err := w.storage.GetHash(h)
 			if err != nil {
@@ -178,7 +181,7 @@ func (w *PaymentWatcher) lookupPaymentFromPeer(p *peer.Peer, lookUpToHeight int3
 				fmt.Println("WARN: should not have empty hash. is something missing?")
 			}
 
-			log.Println("Check block data:", hash, h)
+			w.log.Debugf("Fetch block data of block: %d %s", h, hash)
 			w.QueryBlockDataByPeer(p, hash)
 		}
 	}
@@ -188,7 +191,7 @@ func (w *PaymentWatcher) lookupPaymentFromPeer(p *peer.Peer, lookUpToHeight int3
 func (w *PaymentWatcher) fetchMoreAddress() {
 	for {
 		if w.addrManager.NeedMoreAddresses() {
-			log.Println("need more address. broadcast GetAddr to peers")
+			w.log.Debugf("Need more address. Fetch address from peers.")
 
 			w.connectedPeers.Iter(func(k string, p *peer.Peer) {
 				p.QueueMessage(wire.NewMsgGetAddr(), nil)
@@ -203,19 +206,20 @@ func (w *PaymentWatcher) sync() {
 	SYNC_LOOP:
 		for {
 			p := w.getPeer()
-			log.Println(p, "height:", p.LastBlock(), "last height:", w.lastHeight)
+			w.log.Infof("Peer block height: %d, our block height: %d", p.LastBlock(), w.lastHeight)
 
 			err := w.syncHeaderFromPeer(p)
 			if err != nil {
-				log.Println(err)
 				switch err {
 				case ErrNoNewHeader:
+					w.log.Debug(err.Error())
 					if p.LastBlock() < w.lastHeight {
 						p.Disconnect()
 					} else {
-						time.Sleep(20 * time.Second)
+						time.Sleep(10 * time.Second)
 					}
 				case ErrMissingBlockHeader:
+					w.log.Warnf("Incorrect block data", err.Error())
 					break SYNC_LOOP
 				}
 			} else {
@@ -225,42 +229,45 @@ func (w *PaymentWatcher) sync() {
 			}
 		}
 
-		err := w.rollbackBlock()
-		log.Println("rollback error:", err)
+		if err := w.rollbackBlock(); err != nil {
+			w.log.Errorf("Fail to rollback blocks. Error: %s", err)
+		}
 	}
 }
 
-func (w *PaymentWatcher) Start(firstAddress string) {
+func (w *PaymentWatcher) Start(firstAddress string) error {
 	err := w.storage.Init()
 	if err != nil {
-		log.Fatal("unable to init storage:", err)
+		return fmt.Errorf("unable to init storage. reason: %s", err)
 	}
 
 	lastHash, err := w.storage.GetCheckpoint()
 	if err != nil {
-		log.Fatal("unable to get last hash:", err)
+		w.log.Warnf("unable to get last hash: %s", err)
 	}
 
-	if lastHash == nil {
+	if lastHash != nil {
+		lastHeight, err := w.storage.GetHeight(lastHash)
+		if err != nil {
+			w.log.Warnf("unable to get last hash: %s", err)
+		} else {
+			w.lastHash = lastHash
+			w.lastHeight = lastHeight
+		}
+	}
+
+	// Since lastHeight is zero, we will reset the data from the checkpoint
+	if w.lastHeight == 0 {
 		w.lastHash = w.checkpoint.Hash
 		w.lastHeight = w.checkpoint.Height
 
-		// Write the first hash data into
+		// Write the first hash data into storage
 		if err := w.storage.StoreBlock(w.lastHeight, w.lastHash); err != nil {
-			log.Fatal("unable to set first hash:", err)
+			return fmt.Errorf("unable to set first hash: %s", err)
 		}
-	} else {
-		lastHeight, err := w.storage.GetHeight(lastHash)
-		if err != nil {
-			log.Fatal("unable to get last hash: ", err)
-		}
-
-		w.lastHash = lastHash
-		w.lastHeight = lastHeight
 	}
 
-	log.Println("last hash:", w.lastHash)
-	log.Println("last block height:", w.lastHeight)
+	w.log.Infof("last hash: %s, last block height: %d", w.lastHash, w.lastHeight)
 
 	w.addrManager.Start()
 
@@ -268,8 +275,7 @@ func (w *PaymentWatcher) Start(firstAddress string) {
 	for _, seed := range w.networkParams.DNSSeeds {
 		ips, err := net.LookupIP(seed.Host)
 		if err != nil {
-			// FIXME: warn log
-			log.Println(err)
+			w.log.Warnf("Fail to look up ip from DNS. Error: %s", err)
 			continue
 		}
 		for i, ip := range ips {
@@ -277,7 +283,10 @@ func (w *PaymentWatcher) Start(firstAddress string) {
 			if i > MaximumOutboundPeers/2 {
 				break
 			}
-			w.addrManager.AddAddressByIP(net.JoinHostPort(ip.String(), w.networkParams.DefaultPort))
+			if err := w.addrManager.AddAddressByIP(net.JoinHostPort(ip.String(), w.networkParams.DefaultPort)); err != nil {
+				w.log.Warnf("Can not add an IP into address manager. Error: %s", err)
+			}
+
 		}
 	}
 	if firstAddress != "" {
@@ -288,9 +297,9 @@ func (w *PaymentWatcher) Start(firstAddress string) {
 
 	go func() {
 		for {
-			log.Println("Connected Peers:", w.connectedPeers.Len())
+			w.log.Infof("Connected Peers: %d", w.connectedPeers.Len())
 			// w.connectedPeers.Iter(func(k string, v *peer.Peer) {
-			// 	log.Println("Peer Last Block:", v.LastBlock())
+			// 	w.log.Info("Peer Last Block:", v.LastBlock())
 			// })
 			time.Sleep(30 * time.Second)
 		}
@@ -298,6 +307,8 @@ func (w *PaymentWatcher) Start(firstAddress string) {
 
 	go w.fetchMoreAddress()
 	go w.sync()
+
+	return nil
 }
 
 func (w *PaymentWatcher) Stop() {
@@ -313,9 +324,8 @@ func (w *PaymentWatcher) Stop() {
 		return
 	}
 
-	err := w.storage.SetCheckpoint(w.lastHeight)
-	if err != nil {
-		log.Fatal("can not update the new check point")
+	if err := w.storage.SetCheckpoint(w.lastHeight); err != nil {
+		w.log.Errorf("Can not update the new check point. Error: %s", err)
 	}
 }
 
@@ -337,7 +347,7 @@ func (w *PaymentWatcher) getPeer() *peer.Peer {
 
 		if w.lastHeight-p.LastBlock() > 100 {
 			p.Disconnect()
-			log.Println("disconnect out-date peer")
+			w.log.Tracef("Disconnect out-date peer: %s", p.Addr())
 			time.Sleep(time.Second)
 			continue
 		}
@@ -348,7 +358,7 @@ func (w *PaymentWatcher) getPeer() *peer.Peer {
 
 func (w *PaymentWatcher) onPeerVerAck(p *peer.Peer, msg *wire.MsgVerAck) {
 	if w.connectedPeers.Exist(p.Addr()) {
-		log.Println("drop duplicated connection")
+		w.log.Tracef("Drop duplicated connection: %s", p.Addr())
 		p.Disconnect()
 		return
 	}
@@ -356,16 +366,13 @@ func (w *PaymentWatcher) onPeerVerAck(p *peer.Peer, msg *wire.MsgVerAck) {
 	w.connectedPeers.Add(p.Addr(), p)
 	w.addrManager.Good(p.NA())
 
-	// FIXME: debug log
-	// log.Println("Complete handshake with peer:", p.Addr())
+	w.log.Tracef("Complete neogotiation with the peer: %s", p.Addr())
 }
 
 // onPeerAddr will add discovered new addresses into address manager
 func (w *PaymentWatcher) onPeerAddr(p *peer.Peer, msg *wire.MsgAddr) {
-	// log.Println("OnAddr: address count:", len(msg.AddrList))
 	for _, a := range msg.AddrList {
-		// filter addresses
-		// log.Println("Receive Addr:", a.Services, a.IP, a.Port)
+		w.log.Tracef("Receive new address: %s:%d. Peer service: %s", a.IP, a.Port, a.Services)
 		w.addrManager.AddAddress(a, srcAddr)
 	}
 }
@@ -400,8 +407,7 @@ func (w *PaymentWatcher) onPeerHeaders(p *peer.Peer, msg *wire.MsgHeaders) {
 			}
 			hash, _ := w.storage.GetHash(newHeight)
 			if reflect.DeepEqual(hash.CloneBytes(), newHashByte) {
-				// FIXME: debug log
-				// log.Println("omit the same hash", hash)
+				w.log.Tracef("Omit the same hash: %s", hash)
 				continue
 			}
 		}
@@ -421,8 +427,7 @@ func (w *PaymentWatcher) onPeerHeaders(p *peer.Peer, msg *wire.MsgHeaders) {
 			firstNewHeight = newHeight
 		}
 
-		// FIXME: temp hide
-		log.Println("Add block hash:", newHash, newHeight)
+		w.log.Debugf("Add block hash: %s, %d", newHash, newHeight)
 		if err = w.storage.StoreBlock(newHeight, &newHash); err != nil {
 			return
 		}
@@ -460,7 +465,7 @@ func (w *PaymentWatcher) rollbackBlock() error {
 		deleteDownTo = w.checkpoint.Height
 	}
 
-	log.Println("start rollback blocks to:", deleteDownTo)
+	w.log.Infof("Start rolling back blocks to: %d", deleteDownTo)
 	if err := w.storage.RollbackTo(w.lastHeight, deleteDownTo); err != nil {
 		return err
 	}
@@ -478,10 +483,10 @@ func (w *PaymentWatcher) rollbackBlock() error {
 // onPeerBlock handles block messages from peer. It abstrcts transactions from block data to
 // collect all potential bitmark payment transactions.
 func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byte) {
-	// log.Println("on block", msg.BlockHash())
+	w.log.Tracef("on block: %s", msg.BlockHash())
 
 	if time.Since(msg.Header.Timestamp) > PaymentExpiry {
-		// log.Println("ignore old block:", msg.BlockHash().String())
+		w.log.Tracef("ignore old block: %s", msg.BlockHash().String())
 		return
 	}
 
@@ -492,7 +497,7 @@ func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byt
 	}
 
 	if w.storage.HasBlockReceipt(blockHeight) {
-		// log.Println("block has already processed:", blockHeight)
+		w.log.Tracef("block has already processed: %d", blockHeight)
 		return
 	}
 
@@ -530,10 +535,10 @@ func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byt
 				Timestamp: msg.Header.Timestamp,
 			}
 
-			log.Printf("Find a potential payment. paymentId: %s, paymentInfo: %+v", hex.EncodeToString(payId), paymentInfo)
+			w.log.Infof("Find a potential payment. paymentId: %s, paymentInfo: %+v", hex.EncodeToString(payId), paymentInfo)
 
 			if err := w.storage.StorePayment(payId, paymentInfo); err != nil {
-				log.Println("can not save payments:", paymentInfo, "error:", err)
+				w.log.Errorf("Can not save payments: %+v. Error: %s", paymentInfo, err)
 				continue
 			}
 		}
@@ -541,7 +546,7 @@ func (w *PaymentWatcher) onPeerBlock(p *peer.Peer, msg *wire.MsgBlock, buf []byt
 
 	// add a receipt for processed blocks
 	if err := w.storage.SetBlockReceipt(blockHeight); err != nil {
-		log.Println("can not set block processed:", err)
+		w.log.Errorf("Can not set block processed. Error: %s", err)
 	}
 }
 
@@ -564,16 +569,16 @@ func (w *PaymentWatcher) peerConfig() *peer.Config {
 			OnBlock:   w.onPeerBlock,
 
 			OnTx: func(p *peer.Peer, msg *wire.MsgTx) {
-				log.Println("tx:", msg)
+				w.log.Debugf("tx: %+v", msg)
 			},
 			OnAlert: func(p *peer.Peer, msg *wire.MsgAlert) {
-				log.Println("alert:", msg)
+				w.log.Debugf("alert: %+v", msg)
 			},
 			OnNotFound: func(p *peer.Peer, msg *wire.MsgNotFound) {
-				log.Println("not found:", msg)
+				w.log.Debugf("not found: %+v", msg)
 			},
 			OnReject: func(p *peer.Peer, msg *wire.MsgReject) {
-				log.Println("reject:", msg)
+				w.log.Debugf("reject: %+v", msg)
 			},
 		},
 	}
@@ -588,8 +593,7 @@ func (w *PaymentWatcher) peerNeogotiate(conn net.Conn) (*peer.Peer, error) {
 	}
 	w.addrManager.Connected(p.NA())
 
-	// FIXME: add to debug log
-	// log.Println("Try to associate connection to:", ipAddr)
+	w.log.Tracef("Try to associate connection to: %s", ipAddr)
 	p.AssociateConnection(conn)
 
 	return p, nil
@@ -600,10 +604,11 @@ func (w *PaymentWatcher) peerNeogotiate(conn net.Conn) (*peer.Peer, error) {
 func (w *PaymentWatcher) onConnectionConnected(connReq *connmgr.ConnReq, conn net.Conn) {
 	p, err := w.peerNeogotiate(conn)
 	if err != nil {
+		w.log.Warnf("Peer: %s neogotiation failed. Error: %s", connReq.Addr.String(), err)
 		w.connManager.Disconnect(connReq.ID())
 	}
 
-	// info connection manager that a connection is terminated
+	// To info connection manager that a connection is terminated
 	go func() {
 		p.WaitForDisconnect()
 		w.connManager.Disconnect(connReq.ID())
@@ -613,6 +618,6 @@ func (w *PaymentWatcher) onConnectionConnected(connReq *connmgr.ConnReq, conn ne
 // onConnectionDisconnected is callback function which is invoked by connection manager when
 // one of its connection request is disconnected.
 func (w *PaymentWatcher) onConnectionDisconnected(connReq *connmgr.ConnReq) {
-	log.Println("clean up disconnected peer:", connReq.Addr.String())
+	w.log.Debugf("Clean up disconnected peer: %s", connReq.Addr.String())
 	w.connectedPeers.Delete(connReq.Addr.String())
 }

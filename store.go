@@ -5,12 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"reflect"
 	"strconv"
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	bolt "github.com/etcd-io/bbolt"
+
+	"github.com/bitmark-inc/logger"
 )
 
 var HeaderBucket = []byte("headers")
@@ -22,11 +23,15 @@ var CheckpointKey = []byte("checkpoint")
 
 type PaymentStorage struct {
 	boltdb *bolt.DB
+	log    *logger.L
 }
 
 func NewPaymentStorage(db *bolt.DB) *PaymentStorage {
+	log := logger.New("storage")
+
 	return &PaymentStorage{
 		boltdb: db,
+		log:    log,
 	}
 }
 
@@ -167,7 +172,7 @@ func (s *PaymentStorage) RollbackTo(deleteFrom, deleteTo int32) error {
 		headers := tx.Bucket(HeaderBucket)
 
 		for i := deleteFrom; i > deleteTo; i-- {
-			fmt.Println("delete block:", i)
+			s.log.Debugf("Delete block: %d", i)
 			heightsByte := []byte(fmt.Sprintf("%08x", i))
 			hashByte := heights.Get(heightsByte)
 			if err := heights.Delete(heightsByte); err != nil {
@@ -222,7 +227,7 @@ func (s *PaymentStorage) StorePayment(payId []byte, payInfo PaymentInfo) error {
 func (s *PaymentStorage) GetPayment(payId string) (height int32, payInfo PaymentInfo, err error) {
 	id, err := hex.DecodeString(payId)
 	if err != nil {
-		log.Println("invalid payment id: ", err)
+		s.log.Errorf("Fail to decode payment id. Error: %s", err)
 		return
 	}
 
@@ -264,7 +269,7 @@ func (s *PaymentStorage) GetPayment(payId string) (height int32, payInfo Payment
 		height = int32(paymentHeight)
 		return nil
 	}); err != nil {
-		log.Println("unable to validate payments: ", err)
+		s.log.Errorf("Unable to validate payments: %s", err)
 		return 0, PaymentInfo{}, err
 	}
 
